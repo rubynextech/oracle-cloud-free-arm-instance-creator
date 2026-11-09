@@ -1,0 +1,136 @@
+
+name: Oracle A1 Capacity Retry
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17,47 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oracle-a1-creator
+  cancel-in-progress: false
+
+jobs:
+  create-instance:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install OCI CLI
+        run: python -m pip install oci-cli
+
+      - name: Configure OCI credentials
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+          OCI_KEY_PASSPHRASE: ${{ secrets.OCI_KEY_PASSPHRASE }}
+          OCI_INSTANCE_CONFIG_JSON: ${{ secrets.OCI_INSTANCE_CONFIG_JSON }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          set -e
+
+          mkdir -p ~/.oci ~/.ssh
+          chmod 700 ~/.oci ~/.ssh
+
+          printf '%s\n' "$OCI_PRIVATE_KEY" \
+            > ~/.oci/oci_api_key.pem
+
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=$HOME/.oci/oci_api_key.pem
+          EOF
+
+          if [ -n "$OCI_KEY_PASSPHRASE" ]; then
+            printf 'pass_phrase=%s\n' \
+              "$OCI_KEY_PASSPHRASE" >> ~/.oci/config
+          fi
+
+          chmod 600 ~/.oci/config
+
+          printf '%s\n' "$SSH_PUBLIC_KEY" \
+            > ~/.ssh/instance.pub
+
+          chmod 600 ~/.ssh/instance.pub
+
+          printf '%s' "$OCI_INSTANCE_CONFIG_JSON" |
+            jq --arg ssh "$HOME/.ssh/instance.pub" \
+            '.ssh_public_key_file = $ssh' \
+            > config.json
+
+          chmod 600 config.json
+
+      - name: Verify OCI authentication
+        run: |
+          oci iam region list \
+            --auth api_key \
+            --profile DEFAULT \
+            --output json > /dev/null
+
+          echo "OCI authentication successful"
+
+      - name: Check existing instance
+        id: check
+        run: |
+          set -e
+
+          COMPARTMENT=$(jq -r '.compartment_id' config.json)
+          DISPLAY_NAME=$(jq -r '.display_name' config.json)
+
+          oci compute instance list \
+            --compartment-id "$COMPARTMENT" \
+            --all \
+            --auth api_key \
+            --profile DEFAULT \
+            --output json > instances.json
+
+          EXISTING=$(jq \
+            --arg name "$DISPLAY_NAME" \
+            '[.data[] |
+              select(."display-name" == $name and
+              ."lifecycle-state" != "TERMINATED")] | length' \
+            instances.json)
+
+          echo "exists=$EXISTING" >> "$GITHUB_OUTPUT"
+
+      - name: Try creating instance
+        if: steps.check.outputs.exists == '0'
+        run: |
+          set +e
+
+          python a1_hammer.py \
+            --interval 30 \
+            --jitter 10 \
+            --once
+
+          RESULT=$?
+
+          set -e
+
+          if [ "$RESULT" -eq 0 ]; then
+            echo "Instance created successfully."
+          elif [ "$RESULT" -eq 1 ]; then
+            echo "No capacity available. Will retry later."
+          else
+            echo "Creator failed. Check logs."
+            exit "$RESULT"
+          fi
